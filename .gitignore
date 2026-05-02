@@ -20,6 +20,9 @@ settings/config.txt
 face_database.pkl
 
 models/*.pt
+!models/best.pt
+!models/yolov8n.pt
+!models/yolov8n-pose.pt
 models/*.pth
 models/*.onnx
 models/*.engine
