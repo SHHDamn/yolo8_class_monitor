@@ -111,7 +111,7 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
     plt.grid(True, linestyle="--", alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "class_focus_timeline.png"), dpi=220)
+    plt.savefig(os.path.join(save_dir, "班级专注率趋势图.png"), dpi=220)
     plt.close()
 
     plt.figure(figsize=(12, 5))
@@ -124,7 +124,7 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
     plt.grid(True, linestyle="--", alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "class_headpose_timeline.png"), dpi=220)
+    plt.savefig(os.path.join(save_dir, "班级抬头低头趋势图.png"), dpi=220)
     plt.close()
 
     plt.figure(figsize=(6.6, 6.2))
@@ -147,7 +147,7 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
         )
         plt.title("专注分布（全量样本）")
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "class_focus_pie.png"), dpi=220)
+    plt.savefig(os.path.join(save_dir, "班级专注分布饼图.png"), dpi=220)
     plt.close()
 
     student_rows_sorted = sorted(student_rows, key=lambda r: r["focus_pct"])
@@ -169,7 +169,7 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
     plt.grid(axis="y", linestyle="--", alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "student_ranking.png"), dpi=220)
+    plt.savefig(os.path.join(save_dir, "学生表现排行图.png"), dpi=220)
     plt.close()
 
     try:
@@ -195,7 +195,7 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
         plt.title("课堂告警时间线")
         plt.grid(True, linestyle="--", alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "warning_timeline.png"), dpi=220)
+    plt.savefig(os.path.join(save_dir, "课堂告警时间线图.png"), dpi=220)
     plt.close()
 
     try:
@@ -220,11 +220,11 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
 
         f.write("图表输出\n")
         f.write("--------------------\n")
-        f.write("1) class_focus_timeline.png：班级专注率趋势\n")
-        f.write("2) class_headpose_timeline.png：抬头/低头趋势\n")
-        f.write("3) class_focus_pie.png：专注分布饼图\n")
-        f.write("4) student_ranking.png：学生专注度/抬头率排行\n")
-        f.write("5) warning_timeline.png：告警时间线\n\n")
+        f.write("1) 班级专注率趋势图.png：班级专注率趋势\n")
+        f.write("2) 班级抬头低头趋势图.png：抬头/低头趋势\n")
+        f.write("3) 班级专注分布饼图.png：专注分布饼图\n")
+        f.write("4) 学生表现排行图.png：学生专注度/抬头率排行\n")
+        f.write("5) 课堂告警时间线图.png：告警时间线\n\n")
 
         if parameter_snapshot:
             f.write("参数快照\n")

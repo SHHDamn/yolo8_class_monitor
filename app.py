@@ -1,9 +1,12 @@
 import atexit
+import copy
 import os
 import pickle
+import queue
 import threading
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from threading import Lock
 
 import cv2
@@ -23,6 +26,20 @@ from classroom_rendering import draw_chinese_text, draw_chinese_texts
 from classroom_reporting import generate_new_classroom_report
 
 matplotlib.use("Agg")
+
+
+@dataclass
+class ReportSnapshot:
+    attention_logs: dict
+    student_states: dict
+    parameter_snapshot: dict
+    warning_events: list
+
+    def get_parameter_snapshot(self):
+        return self.parameter_snapshot
+
+    def get_warning_events(self):
+        return self.warning_events
 
 
 class ClassroomMonitor:
@@ -430,7 +447,7 @@ class ClassroomMonitor:
             ax2.set_title("专注度分布（饼图）")
 
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, "detection_session_overview.png"), dpi=200)
+        plt.savefig(os.path.join(save_dir, "行为识别会话概览图.png"), dpi=200)
         plt.close()
 
     def get_face_database_entries(self):
@@ -1657,16 +1674,16 @@ class ClassroomMonitor:
         plt.grid(True)
         plt.tight_layout()
 
-        plt.savefig(os.path.join(save_dir, "attention_plot.png"), dpi=300)
+        plt.savefig(os.path.join(save_dir, "课堂专注度时间曲线.png"), dpi=300)
         plt.close()
 
-        self.plot_behavior_summary(save_dir)
-        self.plot_warning_timeline(save_dir)
+        self.plot_behavior_overview(save_dir)
+        self.plot_warning_events_overview(save_dir)
         self.plot_session_behavior_dashboard(save_dir)
 
         self.generate_summary_report(save_dir)
 
-    def plot_behavior_summary(self, save_dir):
+    def plot_behavior_overview(self, save_dir):
         """可视化行为统计概览"""
         student_metrics = []
         for person_id, state in self.student_states.items():
@@ -1708,10 +1725,10 @@ class ClassroomMonitor:
             plt.text(x[idx], min(98, top + 2), habit, ha="center", va="bottom", fontsize=8, rotation=20)
 
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, "behavior_summary.png"), dpi=300)
+        plt.savefig(os.path.join(save_dir, "行为统计概览图.png"), dpi=300)
         plt.close()
 
-    def plot_warning_timeline(self, save_dir):
+    def plot_warning_events_overview(self, save_dir):
         """绘制告警时间线。"""
         warning_events = self.get_warning_events()
         plt.figure(figsize=(12, 6))
@@ -1736,7 +1753,7 @@ class ClassroomMonitor:
             plt.grid(True, linestyle="--", alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, "warning_timeline.png"), dpi=300)
+        plt.savefig(os.path.join(save_dir, "课堂告警时间线图.png"), dpi=300)
         plt.close()
 
     def generate_summary_report(self, save_dir):
@@ -1904,7 +1921,7 @@ class ClassroomMonitor:
                 f.write("当前所有学生表现均在正常范围内。\n")
 
             det_txt = os.path.join(save_dir, "detection_session_report.txt")
-            det_png = os.path.join(save_dir, "detection_session_overview.png")
+            det_png = os.path.join(save_dir, "行为识别会话概览图.png")
             if os.path.exists(det_txt):
                 f.write("\n行为识别会话报告\n--------------------\n")
                 f.write(f"文本: {os.path.basename(det_txt)}\n")
@@ -1952,12 +1969,6 @@ class ClassroomMonitor:
             new_cap.release()
             return False, "无法打开所选视频源。"
 
-        # 切换视频源时关闭上一个实时保存句柄，避免文件占用/写入混乱
-        try:
-            self.stop_realtime_recording()
-        except Exception as e:
-            print(f"切换视频源释放实时视频写入器失败: {e}")
-
         if self.cap is not None:
             self.cap.release()
 
@@ -2001,7 +2012,18 @@ class ClassroomMonitorGUI:
         self.total_students_var = tk.IntVar(value=30)
 
         self.monitor = ClassroomMonitor(total_students=self.total_students_var.get())
-        atexit.register(self.monitor.close_finalize_reports)
+        self.monitor_lock = threading.RLock()
+        self.frame_queue = queue.Queue(maxsize=1)
+        self.event_queue = queue.Queue()
+        self.worker_stop_event = threading.Event()
+        self.video_worker_thread = None
+        self.generation_id = 0
+        self.worker_join_timeout = 2.0
+        self._last_frame_payload = None
+        self._pending_face_register_window = None
+        self._pending_face_register_button = None
+        self._pending_face_register_resume = False
+        atexit.register(self._atexit_finalize_reports)
         self._closing = False
         self.running = False
 
@@ -2010,6 +2032,7 @@ class ClassroomMonitorGUI:
         self._last_video_frame_bgr = None
         self._video_progress_visible = False
         self._video_progress_dragging = False
+        self._video_progress_resume_after_drag = False
         self._video_progress_seekable = False
         self._video_progress_total_frames = 0
         self._video_progress_fps = 0.0
@@ -2269,6 +2292,416 @@ class ClassroomMonitorGUI:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.mainloop()
 
+    def _clear_frame_queue(self):
+        while True:
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _next_generation(self):
+        self.generation_id += 1
+        self._last_frame_payload = None
+        self._clear_frame_queue()
+        return self.generation_id
+
+    def _put_latest_frame(self, payload):
+        try:
+            self.frame_queue.put_nowait(payload)
+            return
+        except queue.Full:
+            pass
+
+        try:
+            self.frame_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+        try:
+            self.frame_queue.put_nowait(payload)
+        except queue.Full:
+            pass
+
+    def _queue_event(self, event_type, generation=None, **payload):
+        event = {"type": event_type, **payload}
+        if generation is not None:
+            event["generation"] = generation
+        self.event_queue.put(event)
+
+    def _stop_recording_locked(self, disable=True):
+        final_path = self.monitor.stop_realtime_recording()
+        if disable:
+            self.monitor.realtime_save_enabled = False
+        return final_path
+
+    def _ensure_recording_writer_locked(self, processed_frame, source_mode, generation):
+        events = []
+        if not getattr(self.monitor, "realtime_save_enabled", False):
+            if self.monitor.realtime_video_writer is not None:
+                final_path = self.monitor.stop_realtime_recording()
+                events.append({
+                    "type": "recording_stopped",
+                    "generation": generation,
+                    "path": final_path,
+                    "message": f"录制已停止，文件已保存: {final_path}" if final_path else "录制已关闭。",
+                })
+            return events
+
+        if self.monitor.realtime_video_writer is None:
+            os.makedirs("realtime_videos", exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            src_tag = "file" if source_mode == "file" else "camera"
+            out_path = os.path.join("realtime_videos", f"detect_{src_tag}_{timestamp}.mp4")
+
+            h, w = processed_frame.shape[:2]
+            fps = int(round(self.monitor.target_fps or 30))
+            fps = max(1, min(60, fps))
+            self.monitor.realtime_video_fps = fps
+            writer = cv2.VideoWriter(out_path, self.monitor.realtime_video_fourcc, fps, (w, h))
+            if writer.isOpened():
+                self.monitor.realtime_video_writer = writer
+                self.monitor.realtime_video_path = out_path
+                events.append({
+                    "type": "recording_started",
+                    "generation": generation,
+                    "path": out_path,
+                    "message": f"检测视频实时保存中: {out_path}",
+                })
+            else:
+                writer.release()
+                self.monitor.realtime_video_writer = None
+                self.monitor.realtime_video_path = None
+                self.monitor.realtime_save_enabled = False
+                events.append({
+                    "type": "recording_stopped",
+                    "generation": generation,
+                    "path": None,
+                    "message": "实时保存检测视频失败：无法创建视频写入器。",
+                })
+                return events
+
+        if self.monitor.realtime_video_writer is not None:
+            self.monitor.realtime_video_writer.write(processed_frame)
+        return events
+
+    def _safe_cap_get_locked(self, prop_id):
+        try:
+            value = self.monitor.cap.get(prop_id)
+            if value is None or not np.isfinite(value):
+                return 0.0
+            return float(value)
+        except Exception:
+            return 0.0
+
+    def _build_frame_payload_locked(self, generation, source_mode, raw_frame, processed_frame):
+        attendance_rate = (
+            self.monitor.current_count / self.monitor.total_students * 100
+            if self.monitor.total_students > 0 else 0
+        )
+        class_metrics = self.monitor.calculate_classroom_metrics()
+        object_names = [obj["class_name"] for obj in self.monitor.detected_objects]
+        recognized_count = 0
+        if self.monitor.face_recognition_enabled:
+            recognized_count = sum(
+                1 for state in self.monitor.student_states.values()
+                if state.get("identity", "未知") != "未知"
+            )
+
+        progress = None
+        if source_mode == "file":
+            progress = {
+                "pos_frames": self._safe_cap_get_locked(cv2.CAP_PROP_POS_FRAMES),
+                "pos_msec": self._safe_cap_get_locked(cv2.CAP_PROP_POS_MSEC),
+            }
+
+        return {
+            "generation": generation,
+            "source_mode": source_mode,
+            "frame": processed_frame,
+            "raw_frame": raw_frame if source_mode == "file" else None,
+            "current_count": self.monitor.current_count,
+            "total_students": self.monitor.total_students,
+            "attendance_rate": attendance_rate,
+            "focus_rate": class_metrics["focus_rate"],
+            "head_up_rate": class_metrics["head_up_rate"],
+            "dominant_habit": class_metrics["dominant_habit"],
+            "object_detection_enabled": self.monitor.object_detection_enabled,
+            "object_names": sorted(set(object_names)),
+            "face_recognition_enabled": self.monitor.face_recognition_enabled,
+            "recognized_count": recognized_count,
+            "actual_fps": self.monitor.actual_fps,
+            "target_fps": self.monitor.target_fps,
+            "recording_enabled": self.monitor.realtime_save_enabled,
+            "recording_path": self.monitor.realtime_video_path,
+            "progress": progress,
+        }
+
+    def _video_worker_loop(self, generation, stop_event, source_mode):
+        try:
+            while not stop_event.is_set() and generation == self.generation_id:
+                frame_start = time.perf_counter()
+                recording_events = []
+
+                with self.monitor_lock:
+                    success, frame = self.monitor.cap.read()
+                    if not success:
+                        final_path = self._stop_recording_locked(disable=False)
+                        if final_path:
+                            self._queue_event(
+                                "recording_stopped",
+                                generation,
+                                path=final_path,
+                                message=f"录制已停止，文件已保存: {final_path}",
+                            )
+                        if source_mode == "file":
+                            self._queue_event("video_end", generation, final_path=final_path)
+                        else:
+                            self._queue_event("camera_error", generation, final_path=final_path)
+                        break
+
+                    raw_frame = frame.copy() if source_mode == "file" else None
+                    processed_frame = self.monitor.process_frame(frame, time.time())
+                    recording_events = self._ensure_recording_writer_locked(
+                        processed_frame,
+                        source_mode,
+                        generation,
+                    )
+
+                    process_time = time.perf_counter() - frame_start
+                    self.monitor._frame_processing_times.append(process_time)
+                    if len(self.monitor._frame_processing_times) > 5:
+                        self.monitor._frame_processing_times.pop(0)
+
+                    self.monitor._fps_counter += 1
+                    now = time.time()
+                    if now - self.monitor._fps_last_time >= 1.0:
+                        self.monitor.actual_fps = self.monitor._fps_counter
+                        self.monitor._fps_counter = 0
+                        self.monitor._fps_last_time = now
+
+                    payload = self._build_frame_payload_locked(
+                        generation,
+                        source_mode,
+                        raw_frame,
+                        processed_frame,
+                    )
+
+                for event in recording_events:
+                    self.event_queue.put(event)
+                self._put_latest_frame(payload)
+
+                target_fps = max(1, int(getattr(self.monitor, "target_fps", 30) or 30))
+                delay = max(0.0, (1.0 / target_fps) - (time.perf_counter() - frame_start))
+                if stop_event.wait(delay):
+                    break
+        except Exception as e:
+            self._queue_event("worker_error", generation, message=f"帧处理错误: {e}")
+
+    def _start_video_worker(self):
+        if self.video_worker_thread is not None and self.video_worker_thread.is_alive():
+            return not self.worker_stop_event.is_set()
+
+        self.worker_stop_event = threading.Event()
+        generation = self.generation_id
+        source_mode = self.video_source_mode
+        self.video_worker_thread = threading.Thread(
+            target=self._video_worker_loop,
+            args=(generation, self.worker_stop_event, source_mode),
+            daemon=True,
+        )
+        self.video_worker_thread.start()
+        return True
+
+    def _stop_video_worker(self, update_status=True):
+        worker = self.video_worker_thread
+        if worker is None or not worker.is_alive():
+            self.video_worker_thread = None
+            self.worker_stop_event = threading.Event()
+            return True
+
+        self.worker_stop_event.set()
+        worker.join(timeout=self.worker_join_timeout)
+        if worker.is_alive():
+            if update_status:
+                self.status_label.config(text="后台视频处理仍在停止中，请稍后再试。")
+            return False
+
+        self.video_worker_thread = None
+        self.worker_stop_event = threading.Event()
+        return True
+
+    def _build_report_snapshot_locked(self):
+        attention_logs = {
+            person_id: [dict(row) for row in logs]
+            for person_id, logs in self.monitor.attention_logs.items()
+        }
+        student_states = {
+            person_id: copy.deepcopy(dict(state))
+            for person_id, state in self.monitor.student_states.items()
+        }
+        parameter_snapshot = copy.deepcopy(self.monitor.get_parameter_snapshot())
+        warning_events = copy.deepcopy(self.monitor.get_warning_events())
+        return ReportSnapshot(
+            attention_logs=attention_logs,
+            student_states=student_states,
+            parameter_snapshot=parameter_snapshot,
+            warning_events=warning_events,
+        )
+
+    def _generate_report_from_snapshot_sync(self, final=False):
+        with self.monitor_lock:
+            if final and self.monitor._finalize_report_done:
+                return
+            if final:
+                try:
+                    self._stop_recording_locked()
+                except Exception as e:
+                    print(f"停止录制失败: {e}")
+            snapshot = self._build_report_snapshot_locked()
+            if final:
+                self.monitor._finalize_report_done = True
+
+        generate_new_classroom_report(snapshot, save_dir="attention_logs")
+
+    def _atexit_finalize_reports(self):
+        try:
+            if not self._stop_video_worker(update_status=False):
+                print("后台视频处理未能及时停止，跳过退出时同步清理。")
+                return
+            self._generate_report_from_snapshot_sync(final=True)
+            with self.monitor_lock:
+                self.monitor.release()
+        except Exception as e:
+            print(f"退出清理失败: {e}")
+
+    def _update_video_progress_from_payload(self, payload):
+        if payload.get("source_mode") != "file" or self._video_progress_dragging:
+            return
+
+        progress = payload.get("progress") or {}
+        if self._video_progress_seekable:
+            pos_frames = progress.get("pos_frames")
+            if pos_frames is None:
+                return
+            slider_frame = max(0, min(int(round(pos_frames)), self._video_progress_total_frames - 1))
+            self.video_progress_var.set(slider_frame)
+            self._set_video_progress_label(pos_frames)
+        else:
+            pos_msec = progress.get("pos_msec", 0.0) or 0.0
+            self._set_video_progress_label(elapsed_seconds=pos_msec / 1000)
+
+    def _apply_frame_payload(self, payload):
+        if payload.get("generation") != self.generation_id:
+            return
+
+        self._last_frame_payload = payload
+        processed_frame = payload["frame"]
+        self.current_frame = processed_frame.copy()
+        if payload.get("raw_frame") is not None:
+            self._last_video_frame_bgr = payload["raw_frame"].copy()
+
+        self.attendance_label.config(
+            text=(
+                f"出勤率: {payload['current_count']}/{payload['total_students']} "
+                f"({payload['attendance_rate']:.1f}%)"
+            )
+        )
+        self.analysis_label.config(
+            text=(
+                f"专注度 {payload['focus_rate']:.1f}% | "
+                f"抬头率 {payload['head_up_rate']:.1f}% | "
+                f"FPS {payload['actual_fps']:.0f}/{payload['target_fps']}"
+            )
+        )
+        self.habit_label.config(text=f"主导习惯: {payload['dominant_habit']}")
+
+        if payload["source_mode"] == "file" and self.object_var.get():
+            self.object_label.config(text="桌面物品检测: 本地视频模式已停用", fg="#FF9800")
+        elif payload["object_names"]:
+            self.object_label.config(
+                text=f"检测到桌面物品: {', '.join(payload['object_names'])}",
+                fg="#FF9800",
+            )
+        elif payload["object_detection_enabled"]:
+            self.object_label.config(text="桌面物品: 未检测", fg="#FF9800")
+        else:
+            self.object_label.config(text="桌面物品检测: 已关闭", fg="#9E9E9E")
+
+        if payload["face_recognition_enabled"]:
+            self.face_label.config(text=f"已识别学生: {payload['recognized_count']}人", fg="#4CAF50")
+        else:
+            self._refresh_face_status()
+
+        self._render_frame_on_canvas(processed_frame)
+        self._update_video_progress_from_payload(payload)
+
+    def _handle_event(self, event):
+        generation = event.get("generation")
+        if generation is not None and generation != self.generation_id:
+            return
+
+        event_type = event.get("type")
+        if event_type == "recording_started":
+            self._refresh_recording_status()
+            self.status_label.config(text=event.get("message", "录制已开始。"))
+        elif event_type == "recording_stopped":
+            self._refresh_recording_status()
+            self.status_label.config(text=event.get("message", "录制已停止。"))
+        elif event_type == "video_end":
+            self.running = False
+            self.start_btn.config(state="normal")
+            self.pause_btn.config(state="disabled")
+            self._refresh_run_controls()
+            self._update_video_progress(force_end=True)
+            self._refresh_recording_status()
+            final_path = event.get("final_path")
+            if final_path:
+                self.status_label.config(text=f"本地视频已播放结束，录制文件已保存: {final_path}")
+            else:
+                self.status_label.config(text="本地视频已播放结束，可重新打开视频或切换回摄像头。")
+        elif event_type == "camera_error":
+            self.running = False
+            self.start_btn.config(state="normal")
+            self.pause_btn.config(state="disabled")
+            self._refresh_run_controls()
+            self._refresh_recording_status()
+            final_path = event.get("final_path")
+            if final_path:
+                self.status_label.config(text=f"当前摄像头无法读取画面，录制文件已保存: {final_path}")
+            else:
+                self.status_label.config(text="当前摄像头无法读取画面。")
+        elif event_type == "worker_error":
+            self.running = False
+            self.start_btn.config(state="normal")
+            self.pause_btn.config(state="disabled")
+            self._refresh_run_controls()
+            self.status_label.config(text=event.get("message", "后台视频处理失败。"))
+        elif event_type == "report_done":
+            if event.get("success"):
+                self._report_done()
+            else:
+                self.status_label.config(text=event.get("message", "报告生成失败。"))
+        elif event_type == "face_register_done":
+            self._handle_face_register_done(event)
+
+    def _drain_event_queue(self):
+        while True:
+            try:
+                event = self.event_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_event(event)
+
+    def _drain_frame_queue(self):
+        latest = None
+        while True:
+            try:
+                latest = self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+        if latest is not None:
+            self._apply_frame_payload(latest)
+
     def update_total_students(self):
         """更新总学生数"""
         try:
@@ -2276,9 +2709,11 @@ class ClassroomMonitorGUI:
             if total <= 0:
                 raise ValueError("人数必须大于 0")
 
-            self.monitor.set_total_students(total)
+            with self.monitor_lock:
+                self.monitor.set_total_students(total)
+                current_count = self.monitor.current_count
             self.attendance_label.config(
-                text=f"出勤率: {self.monitor.current_count}/{total} ({self.monitor.current_count / total * 100:.1f}%)")
+                text=f"出勤率: {current_count}/{total} ({current_count / total * 100:.1f}%)")
             self.status_label.config(text=f"班级总人数已更新为: {total}")
         except ValueError as e:
             self.status_label.config(text=f"错误: {str(e)}")
@@ -2315,11 +2750,13 @@ class ClassroomMonitorGUI:
         self.root.config(menu=menubar)
 
     def _refresh_recording_status(self):
-        recording = bool(self.monitor.realtime_save_enabled)
+        with self.monitor_lock:
+            recording = bool(self.monitor.realtime_save_enabled)
+            recording_path = self.monitor.realtime_video_path
         if recording:
             label = "录制: 已开启，等待开始"
-            if self.monitor.realtime_video_path:
-                label = f"录制: 进行中 ({os.path.basename(self.monitor.realtime_video_path)})"
+            if recording_path:
+                label = f"录制: 进行中 ({os.path.basename(recording_path)})"
             self.record_label.config(text=label, fg="#4CAF50")
             self.record_btn.config(text="停止录制", bg="#D32F2F")
             if hasattr(self, "file_menu") and hasattr(self, "record_menu_index"):
@@ -2346,6 +2783,10 @@ class ClassroomMonitorGUI:
     def start(self):
         """开始监测"""
         self.running = True
+        if not self._start_video_worker():
+            self.running = False
+            self.status_label.config(text="后台视频处理仍在停止中，请稍后再开始。")
+            return
         self.status_label.config(text="本地视频播放中..." if self.video_source_mode == "file" else "系统运行中...")
         self.start_btn.config(state="disabled")
         self.pause_btn.config(state="normal")
@@ -2354,6 +2795,7 @@ class ClassroomMonitorGUI:
     def pause(self):
         """暂停监测"""
         self.running = False
+        self._stop_video_worker()
         self.status_label.config(text="视频播放已暂停。" if self.video_source_mode == "file" else "监测已暂停。")
         self.start_btn.config(state="normal")
         self.pause_btn.config(state="disabled")
@@ -2362,22 +2804,19 @@ class ClassroomMonitorGUI:
             self._refresh_paused_local_video_frame()
 
     def _refresh_paused_local_video_frame(self):
-        """暂停本地视频时，对当前静止帧做一次行为识别预览。"""
+        """暂停本地视频时保留最近一次 worker 输出的画面。"""
         if self.video_source_mode != "file":
             return
-        raw = self._last_video_frame_bgr
-        if raw is None:
+        payload = self._last_frame_payload
+        if not payload or payload.get("generation") != self.generation_id:
             return
         try:
-            processed_frame, used_behavior_model = self.monitor.process_local_behavior_preview(raw.copy())
+            processed_frame = payload["frame"]
             self.current_frame = processed_frame.copy()
             self._render_frame_on_canvas(processed_frame)
-            if used_behavior_model:
-                self.status_label.config(text="视频已暂停，已对当前画面完成行为识别预览。")
-            else:
-                self.status_label.config(text="视频已暂停，未加载到行为模型，保持抬头/低头预览。")
+            self.status_label.config(text="视频已暂停，保留当前检测画面。")
         except Exception as e:
-            self.status_label.config(text=f"暂停帧行为识别预览失败: {e}")
+            self.status_label.config(text=f"暂停画面刷新失败: {e}")
 
     def _update_source_label(self):
         """刷新当前视频源显示。"""
@@ -2412,27 +2851,32 @@ class ClassroomMonitorGUI:
     def _switch_video_source(self, video_source, source_mode, status_text, video_path=None):
         """切换到新的摄像头或本地视频源。"""
         self.running = False
+        if not self._stop_video_worker():
+            return False
+        self._next_generation()
         self.pause_btn.config(state="disabled")
         self.start_btn.config(state="normal")
         self._refresh_run_controls()
 
-        success, error = self.monitor.set_video_source(video_source)
-        if not success:
-            self.status_label.config(text=error)
-            return False
+        with self.monitor_lock:
+            self._stop_recording_locked(disable=False)
+            success, error = self.monitor.set_video_source(video_source)
+            if not success:
+                self.status_label.config(text=error)
+                return False
 
-        # 本地视频上传检测：只做抬头/低头，禁用其它姿态/行为
-        if source_mode == "file":
-            self.monitor.simple_pose_only = True
-            self.monitor.object_detection_enabled = False
-            self.monitor.face_recognition_enabled = False
-            self.monitor.behavior_model_enabled = False
-        else:
-            self.monitor.simple_pose_only = False
-            # 恢复 UI 开关状态（行为模型按是否成功加载决定）
-            self.monitor.object_detection_enabled = bool(self.object_var.get()) if hasattr(self, "object_var") else self.monitor.object_detection_enabled
-            self.monitor.face_recognition_enabled = bool(self.face_var.get()) if hasattr(self, "face_var") else self.monitor.face_recognition_enabled
-            self.monitor.behavior_model_enabled = os.path.exists(self.monitor.behavior_model_path)
+            # 本地视频上传检测：只做抬头/低头，禁用其它姿态/行为
+            if source_mode == "file":
+                self.monitor.simple_pose_only = True
+                self.monitor.object_detection_enabled = False
+                self.monitor.face_recognition_enabled = False
+                self.monitor.behavior_model_enabled = False
+            else:
+                self.monitor.simple_pose_only = False
+                # 恢复 UI 开关状态（行为模型按是否成功加载决定）
+                self.monitor.object_detection_enabled = bool(self.object_var.get()) if hasattr(self, "object_var") else self.monitor.object_detection_enabled
+                self.monitor.face_recognition_enabled = bool(self.face_var.get()) if hasattr(self, "face_var") else self.monitor.face_recognition_enabled
+                self.monitor.behavior_model_enabled = os.path.exists(self.monitor.behavior_model_path)
 
         self.video_source_mode = source_mode
         self.current_video_path = video_path if source_mode == "file" else None
@@ -2588,6 +3032,12 @@ class ClassroomMonitorGUI:
     def _on_video_progress_press(self, event):
         if self.video_source_mode != "file":
             return
+        self._video_progress_resume_after_drag = self.running
+        if self.running:
+            self.running = False
+            if not self._stop_video_worker():
+                self._video_progress_resume_after_drag = False
+                return
         self._refresh_video_progress_metadata()
         if self._video_progress_seekable:
             self._video_progress_dragging = True
@@ -2620,33 +3070,43 @@ class ClassroomMonitorGUI:
         if self.video_source_mode != "file":
             return
 
+        resume_after_seek = bool(getattr(self, "_video_progress_resume_after_drag", False) or self.running)
+        self.running = False
+        if not self._stop_video_worker():
+            return
+        self._next_generation()
         self._refresh_video_progress_metadata()
         if not self._video_progress_seekable:
             self._update_video_progress()
             return
 
         target_frame = max(0, min(int(round(target_frame)), self._video_progress_total_frames - 1))
-        was_running = self.running
         try:
-            if not self.monitor.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame):
-                raise RuntimeError("视频源不支持精确跳转")
+            with self.monitor_lock:
+                if not self.monitor.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame):
+                    raise RuntimeError("视频源不支持精确跳转")
         except Exception as e:
             self.status_label.config(text=f"视频跳转失败: {e}")
             self._update_video_progress()
             return
 
-        self.monitor.reset_runtime_state()
+        with self.monitor_lock:
+            self.monitor.reset_runtime_state()
         self._reset_panels_after_video_seek()
 
-        if not was_running:
+        if not resume_after_seek:
             try:
-                success, preview_frame = self.monitor.cap.read()
+                with self.monitor_lock:
+                    success, preview_frame = self.monitor.cap.read()
+                    if success:
+                        self.monitor.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                 if success:
                     self._last_video_frame_bgr = preview_frame.copy()
                     self._render_frame_on_canvas(preview_frame)
-                    self.monitor.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
             except Exception as e:
                 print(f"跳转预览帧失败: {e}")
+        else:
+            self.start()
 
         self.video_progress_var.set(target_frame)
         self._set_video_progress_label(target_frame)
@@ -2660,6 +3120,7 @@ class ClassroomMonitorGUI:
             self._update_video_progress()
             return
         self._seek_local_video(self.video_progress_var.get())
+        self._video_progress_resume_after_drag = False
 
     def _render_frame_on_canvas(self, frame):
         """将处理后的帧按比例绘制到主画布。"""
@@ -2695,67 +3156,69 @@ class ClassroomMonitorGUI:
 
     def update_sensitivity(self, value):
         """更新低头检测灵敏度"""
-        self.monitor.head_down_threshold = float(value)
+        with self.monitor_lock:
+            self.monitor.head_down_threshold = float(value)
 
     def update_time_threshold(self, value):
         """更新分心时间阈值"""
-        self.monitor.time_threshold = float(value)
+        with self.monitor_lock:
+            self.monitor.time_threshold = float(value)
 
     def update_turn_threshold(self, value):
         """更新转头角度阈值"""
-        self.monitor.head_turn_threshold = float(value)
+        with self.monitor_lock:
+            self.monitor.head_turn_threshold = float(value)
 
     def update_confidence(self, value):
         """更新置信度阈值"""
-        self.monitor.confidence_threshold = float(value)
+        with self.monitor_lock:
+            self.monitor.confidence_threshold = float(value)
 
     def update_filter_size(self, value):
         """更新平滑窗口大小"""
-        self.monitor.filter_size = int(float(value))
+        with self.monitor_lock:
+            self.monitor.filter_size = int(float(value))
 
     def toggle_debug(self):
         """切换调试模式"""
-        self.monitor.debug = self.debug_var.get()
+        with self.monitor_lock:
+            self.monitor.debug = self.debug_var.get()
 
     def toggle_beep(self):
         """切换声音提醒"""
-        self.monitor.beep_enabled = self.beep_var.get()
+        with self.monitor_lock:
+            self.monitor.beep_enabled = self.beep_var.get()
 
     def toggle_object_detection(self):
         """切换桌面物品检测"""
-        self.monitor.object_detection_enabled = self.object_var.get()
+        with self.monitor_lock:
+            self.monitor.object_detection_enabled = self.object_var.get()
         if self.object_var.get():
             if self.video_source_mode == "file":
-                self.monitor.object_detection_enabled = False
+                with self.monitor_lock:
+                    self.monitor.object_detection_enabled = False
                 self.object_label.config(text="桌面物品检测: 切回摄像头后生效", fg="#FF9800")
                 self.status_label.config(text="本地视频模式不启用桌面物品检测，切回摄像头后生效。")
                 return
-            if self.video_source_mode != "file":
-                ok, message = self.monitor.ensure_object_model_loaded()
-                if not ok:
-                    self.object_var.set(False)
-                    self.monitor.object_detection_enabled = False
-                    self.object_label.config(text="桌面物品检测: 加载失败", fg="#F44336")
-                    self.status_label.config(text=message)
-                    return
             self.object_label.config(text="桌面物品检测: 已开启", fg="#4CAF50")
+            self.status_label.config(text="桌面物品检测已开启，模型将在下一帧按需加载。")
         else:
+            with self.monitor_lock:
+                self.monitor.object_detection_enabled = False
             self.object_label.config(text="桌面物品检测: 已关闭", fg="#9E9E9E")
 
     def toggle_face_recognition(self):
         """切换人脸识别"""
-        self.monitor.face_recognition_enabled = self.face_var.get()
+        with self.monitor_lock:
+            self.monitor.face_recognition_enabled = self.face_var.get()
         if self.face_var.get() and self.video_source_mode == "file":
-            self.monitor.face_recognition_enabled = False
+            with self.monitor_lock:
+                self.monitor.face_recognition_enabled = False
             self.status_label.config(text="本地视频模式不启用人脸识别，切回摄像头后生效。")
             self.face_label.config(text="人脸识别: 切回摄像头后生效", fg="#FF9800")
             return
         if self.face_var.get() and self.video_source_mode != "file":
-            ok, message = self.monitor.ensure_face_models_loaded()
-            if not ok:
-                self.face_var.set(False)
-                self.monitor.face_recognition_enabled = False
-                self.status_label.config(text=message)
+            self.status_label.config(text="人脸识别已开启，模型将在下一帧按需加载。")
         self._refresh_face_status()
 
     def _refresh_face_status(self):
@@ -2801,17 +3264,53 @@ class ClassroomMonitorGUI:
             if not name:
                 self.status_label.config(text="请输入有效的姓名")
                 return
-            
-            # 从当前帧中提取人脸
-            success = self.monitor.add_face_to_database(self.current_frame, name)
-            if success:
-                self.status_label.config(text=f"成功注册人脸：{name}")
-                restore_run()
-            else:
-                self.status_label.config(text=f"注册失败：未检测到人脸或无法提取特征")
-        
-        tk.Button(register_window, text="确认注册", command=do_register,
-                  bg="#4CAF50", fg="white", font=("黑体", 12)).pack(pady=20)
+
+            frame = self.current_frame.copy()
+            self._pending_face_register_window = register_window
+            self._pending_face_register_button = submit_btn
+            self._pending_face_register_resume = was_running
+            submit_btn.config(state="disabled")
+            self.status_label.config(text=f"正在后台注册人脸：{name}")
+            worker = threading.Thread(
+                target=self._face_register_worker,
+                args=(frame, name),
+                daemon=True,
+            )
+            worker.start()
+
+        submit_btn = tk.Button(register_window, text="确认注册", command=do_register,
+                               bg="#4CAF50", fg="white", font=("黑体", 12))
+        submit_btn.pack(pady=20)
+
+    def _face_register_worker(self, frame, name):
+        try:
+            with self.monitor_lock:
+                success = self.monitor.add_face_to_database(frame, name)
+            self._queue_event("face_register_done", success=success, name=name)
+        except Exception as e:
+            self._queue_event("face_register_done", success=False, name=name, message=str(e))
+
+    def _handle_face_register_done(self, event):
+        success = bool(event.get("success"))
+        name = event.get("name", "")
+        window = self._pending_face_register_window
+        button = self._pending_face_register_button
+        resume_after = self._pending_face_register_resume
+
+        if success:
+            self.status_label.config(text=f"成功注册人脸：{name}")
+            if window is not None and window.winfo_exists():
+                window.destroy()
+            self._pending_face_register_window = None
+            self._pending_face_register_button = None
+            self._pending_face_register_resume = False
+            if resume_after and not self._closing:
+                self.start()
+        else:
+            message = event.get("message") or "未检测到人脸或无法提取特征"
+            self.status_label.config(text=f"注册失败：{message}")
+            if button is not None and button.winfo_exists():
+                button.config(state="normal")
 
     def open_face_database_manager(self):
         """打开人脸库管理窗口。"""
@@ -2872,7 +3371,8 @@ class ClassroomMonitorGUI:
         if not hasattr(self, "face_db_listbox") or not self.face_db_listbox.winfo_exists():
             return
 
-        self.face_db_entries = self.monitor.get_face_database_entries()
+        with self.monitor_lock:
+            self.face_db_entries = self.monitor.get_face_database_entries()
         self.face_db_listbox.delete(0, tk.END)
 
         for entry in self.face_db_entries:
@@ -2910,7 +3410,8 @@ class ClassroomMonitorGUI:
         if not confirmed:
             return
 
-        success, result = self.monitor.delete_face_from_database(entry["index"])
+        with self.monitor_lock:
+            success, result = self.monitor.delete_face_from_database(entry["index"])
         if success:
             self._refresh_face_database_list()
             self.face_db_status_label.config(text=f"已删除身份：{result}")
@@ -2939,9 +3440,11 @@ class ClassroomMonitorGUI:
             messagebox.showwarning("姓名无效", "姓名不能为空。")
             return
 
+        with self.monitor_lock:
+            entries = self.monitor.get_face_database_entries()
         duplicate_exists = any(
             item["name"] == normalized_name and item["index"] != entry["index"]
-            for item in self.monitor.get_face_database_entries()
+            for item in entries
         )
         if duplicate_exists:
             confirmed = messagebox.askyesno(
@@ -2951,7 +3454,8 @@ class ClassroomMonitorGUI:
             if not confirmed:
                 return
 
-        success, result = self.monitor.rename_face_in_database(entry["index"], normalized_name)
+        with self.monitor_lock:
+            success, result = self.monitor.rename_face_in_database(entry["index"], normalized_name)
         if success:
             self._refresh_face_database_list()
             self.face_db_status_label.config(text=f"已重命名身份：{result} -> {normalized_name}")
@@ -2966,16 +3470,24 @@ class ClassroomMonitorGUI:
 
     def toggle_recording(self):
         """切换录像状态"""
-        enabled = not self.monitor.realtime_save_enabled
-        final_path = self.monitor.set_recording_enabled(enabled)
-        self._refresh_recording_status()
+        with self.monitor_lock:
+            enabled = not self.monitor.realtime_save_enabled
+            if enabled:
+                self.monitor.realtime_save_enabled = True
+                final_path = None
+            else:
+                final_path = self._stop_recording_locked()
+
         if enabled:
+            self._refresh_recording_status()
             self.status_label.config(text="录制已开启，下一帧开始保存检测视频。")
         else:
-            if final_path:
-                self.status_label.config(text=f"录制已停止，文件已保存: {final_path}")
-            else:
-                self.status_label.config(text="录制已关闭。")
+            self._queue_event(
+                "recording_stopped",
+                self.generation_id,
+                path=final_path,
+                message=f"录制已停止，文件已保存: {final_path}" if final_path else "录制已关闭。",
+            )
 
     def generate_report(self):
         """生成报告"""
@@ -2986,9 +3498,14 @@ class ClassroomMonitorGUI:
 
     def _generate_report_thread(self):
         """在工作线程中生成报告"""
-        # 新版报告生成（替代旧版学习/行为报告）
-        generate_new_classroom_report(self.monitor, save_dir="attention_logs")
-        self.root.after(0, self._report_done)
+        try:
+            with self.monitor_lock:
+                snapshot = self._build_report_snapshot_locked()
+            # 新版报告生成（替代旧版学习/行为报告）
+            generate_new_classroom_report(snapshot, save_dir="attention_logs")
+            self._queue_event("report_done", success=True)
+        except Exception as e:
+            self._queue_event("report_done", success=False, message=f"报告生成失败: {e}")
 
     def _report_done(self):
         """报告生成完成后的回调"""
@@ -3033,21 +3550,24 @@ class ClassroomMonitorGUI:
         self.face_var.set(False)
         self.total_students_var.set(30)
 
-        self.monitor.head_down_threshold = 18
-        self.monitor.time_threshold = 2.0
-        self.monitor.head_turn_threshold = 35
-        self.monitor.confidence_threshold = 0.45
-        self.monitor.filter_size = 3
-        self.monitor.debug = True
-        self.monitor.beep_enabled = False
-        self.monitor.object_detection_enabled = False
-        self.monitor.face_recognition_enabled = False
-        self.monitor.set_recording_enabled(False)
-        self.monitor.set_total_students(30)
+        with self.monitor_lock:
+            self.monitor.head_down_threshold = 18
+            self.monitor.time_threshold = 2.0
+            self.monitor.head_turn_threshold = 35
+            self.monitor.confidence_threshold = 0.45
+            self.monitor.filter_size = 3
+            self.monitor.debug = True
+            self.monitor.beep_enabled = False
+            self.monitor.object_detection_enabled = False
+            self.monitor.face_recognition_enabled = False
+            self._stop_recording_locked()
+            self.monitor.set_total_students(30)
+            current_count = self.monitor.current_count
+            total_students = self.monitor.total_students
 
-        attendance_rate = self.monitor.current_count / self.monitor.total_students * 100
+        attendance_rate = current_count / total_students * 100
         self.attendance_label.config(
-            text=f"出勤率: {self.monitor.current_count}/{self.monitor.total_students} ({attendance_rate:.1f}%)")
+            text=f"出勤率: {current_count}/{total_students} ({attendance_rate:.1f}%)")
 
         self.analysis_label.config(text="专注度 0.0% | 抬头率 0.0%")
         self.habit_label.config(text="主导习惯: 数据不足")
@@ -3058,19 +3578,20 @@ class ClassroomMonitorGUI:
 
     def save_settings(self):
         """保存当前设置到文件"""
-        settings = {
-            "head_down_threshold": self.monitor.head_down_threshold,
-            "time_threshold": self.monitor.time_threshold,
-            "head_turn_threshold": self.monitor.head_turn_threshold,
-            "confidence_threshold": self.monitor.confidence_threshold,
-            "filter_size": self.monitor.filter_size,
-            "debug": self.monitor.debug,
-            "beep_enabled": self.beep_var.get(),
-            "object_detection_enabled": self.object_var.get(),
-            "face_recognition_enabled": self.face_var.get(),
-            "recording_enabled": self.monitor.realtime_save_enabled,
-            "total_students": self.monitor.total_students
-        }
+        with self.monitor_lock:
+            settings = {
+                "head_down_threshold": self.monitor.head_down_threshold,
+                "time_threshold": self.monitor.time_threshold,
+                "head_turn_threshold": self.monitor.head_turn_threshold,
+                "confidence_threshold": self.monitor.confidence_threshold,
+                "filter_size": self.monitor.filter_size,
+                "debug": self.monitor.debug,
+                "beep_enabled": self.beep_var.get(),
+                "object_detection_enabled": self.object_var.get(),
+                "face_recognition_enabled": self.face_var.get(),
+                "recording_enabled": self.monitor.realtime_save_enabled,
+                "total_students": self.monitor.total_students
+            }
 
         try:
             os.makedirs("settings", exist_ok=True)
@@ -3105,35 +3626,43 @@ class ClassroomMonitorGUI:
 
             if "head_down_threshold" in settings:
                 self.sensitivity_slider.set(settings["head_down_threshold"])
-                self.monitor.head_down_threshold = settings["head_down_threshold"]
+                with self.monitor_lock:
+                    self.monitor.head_down_threshold = settings["head_down_threshold"]
 
             if "time_threshold" in settings:
                 self.time_slider.set(settings["time_threshold"])
-                self.monitor.time_threshold = settings["time_threshold"]
+                with self.monitor_lock:
+                    self.monitor.time_threshold = settings["time_threshold"]
 
             if "head_turn_threshold" in settings:
                 self.turn_slider.set(settings["head_turn_threshold"])
-                self.monitor.head_turn_threshold = settings["head_turn_threshold"]
+                with self.monitor_lock:
+                    self.monitor.head_turn_threshold = settings["head_turn_threshold"]
 
             if "confidence_threshold" in settings:
                 self.conf_slider.set(settings["confidence_threshold"])
-                self.monitor.confidence_threshold = settings["confidence_threshold"]
+                with self.monitor_lock:
+                    self.monitor.confidence_threshold = settings["confidence_threshold"]
 
             if "filter_size" in settings:
                 self.filter_slider.set(settings["filter_size"])
-                self.monitor.filter_size = int(settings["filter_size"])
+                with self.monitor_lock:
+                    self.monitor.filter_size = int(settings["filter_size"])
 
             if "debug" in settings:
                 self.debug_var.set(settings["debug"])
-                self.monitor.debug = settings["debug"]
+                with self.monitor_lock:
+                    self.monitor.debug = settings["debug"]
 
             if "beep_enabled" in settings:
                 self.beep_var.set(settings["beep_enabled"])
-                self.monitor.beep_enabled = settings["beep_enabled"]
+                with self.monitor_lock:
+                    self.monitor.beep_enabled = settings["beep_enabled"]
 
             if "object_detection_enabled" in settings:
                 self.object_var.set(settings["object_detection_enabled"])
-                self.monitor.object_detection_enabled = settings["object_detection_enabled"]
+                with self.monitor_lock:
+                    self.monitor.object_detection_enabled = settings["object_detection_enabled"]
                 if settings["object_detection_enabled"]:
                     self.object_label.config(text="桌面物品检测: 已开启", fg="#4CAF50")
                 else:
@@ -3141,20 +3670,29 @@ class ClassroomMonitorGUI:
 
             if "face_recognition_enabled" in settings:
                 self.face_var.set(settings["face_recognition_enabled"])
-                self.monitor.face_recognition_enabled = settings["face_recognition_enabled"]
+                with self.monitor_lock:
+                    self.monitor.face_recognition_enabled = settings["face_recognition_enabled"]
                 self._refresh_face_status()
 
             if "recording_enabled" in settings:
-                self.monitor.set_recording_enabled(settings["recording_enabled"])
+                with self.monitor_lock:
+                    if settings["recording_enabled"]:
+                        self.monitor.realtime_save_enabled = True
+                    else:
+                        self._stop_recording_locked()
                 self._refresh_recording_status()
 
             if "total_students" in settings:
                 self.total_students_var.set(int(settings["total_students"]))
-                self.monitor.set_total_students(int(settings["total_students"]))
+                with self.monitor_lock:
+                    self.monitor.set_total_students(int(settings["total_students"]))
 
-            attendance_rate = self.monitor.current_count / self.monitor.total_students * 100 if self.monitor.total_students > 0 else 0
+            with self.monitor_lock:
+                current_count = self.monitor.current_count
+                total_students = self.monitor.total_students
+            attendance_rate = current_count / total_students * 100 if total_students > 0 else 0
             self.attendance_label.config(
-                text=f"出勤率: {self.monitor.current_count}/{self.monitor.total_students} ({attendance_rate:.1f}%)")
+                text=f"出勤率: {current_count}/{total_students} ({attendance_rate:.1f}%)")
 
             self._refresh_face_status()
             self.status_label.config(text="设置已加载。")
@@ -3211,11 +3749,11 @@ class ClassroomMonitorGUI:
 
 7. 报告输出
    - 文本报告保存在 attention_logs/classroom_report.txt
-   - 班级专注率趋势图保存在 attention_logs/class_focus_timeline.png
-   - 抬头/低头趋势图保存在 attention_logs/class_headpose_timeline.png
-   - 专注分布饼图保存在 attention_logs/class_focus_pie.png
-   - 学生排行图保存在 attention_logs/student_ranking.png
-   - 告警时间线图保存在 attention_logs/warning_timeline.png
+   - 班级专注率趋势图保存在 attention_logs/班级专注率趋势图.png
+   - 抬头/低头趋势图保存在 attention_logs/班级抬头低头趋势图.png
+   - 专注分布饼图保存在 attention_logs/班级专注分布饼图.png
+   - 学生排行图保存在 attention_logs/学生表现排行图.png
+   - 告警时间线图保存在 attention_logs/课堂告警时间线图.png
 """
         help_text.insert(tk.END, help_content)
         help_text.config(state="disabled")
@@ -3248,121 +3786,10 @@ class ClassroomMonitorGUI:
         copyright_label.pack(side="bottom", pady=10)
 
     def update_video(self):
-        """更新视频帧"""
-        if self.running:
-            frame_start = time.perf_counter()
-
-            success, frame = self.monitor.cap.read()
-            if not success:
-                final_path = self.monitor.stop_realtime_recording()
-                if self.video_source_mode == "file":
-                    self.running = False
-                    self.start_btn.config(state="normal")
-                    self.pause_btn.config(state="disabled")
-                    self._update_video_progress(force_end=True)
-                    if final_path:
-                        self.status_label.config(text=f"本地视频已播放结束，录制文件已保存: {final_path}")
-                    else:
-                        self.status_label.config(text="本地视频已播放结束，可重新打开视频或切换回摄像头。")
-                else:
-                    if final_path:
-                        self.status_label.config(text=f"当前摄像头无法读取画面，录制文件已保存: {final_path}")
-                    else:
-                        self.status_label.config(text="当前摄像头无法读取画面。")
-                self._refresh_recording_status()
-                self.root.after(30, self.update_video)
-                return
-
-            try:
-                current_time = time.time()
-                if self.video_source_mode == "file":
-                    self._last_video_frame_bgr = frame.copy()
-                processed_frame = self.monitor.process_frame(frame, current_time)
-                self.current_frame = processed_frame.copy()
-            except Exception as e:
-                print(f"帧处理错误: {str(e)}")
-                self.root.after(30, self.update_video)
-                return
-
-            # 实时保存检测视频
-            try:
-                if getattr(self.monitor, "realtime_save_enabled", False):
-                    if self.monitor.realtime_video_writer is None:
-                        os.makedirs("realtime_videos", exist_ok=True)
-                        timestamp = time.strftime("%Y%m%d_%H%M%S")
-                        src_tag = "file" if self.video_source_mode == "file" else "camera"
-                        out_path = os.path.join("realtime_videos", f"detect_{src_tag}_{timestamp}.mp4")
-
-                        h, w = processed_frame.shape[:2]
-                        fps = int(round(self.monitor.target_fps or 30))
-                        fps = max(1, min(60, fps))
-                        self.monitor.realtime_video_fps = fps
-                        writer = cv2.VideoWriter(out_path, self.monitor.realtime_video_fourcc, fps, (w, h))
-                        if writer.isOpened():
-                            self.monitor.realtime_video_writer = writer
-                            self.monitor.realtime_video_path = out_path
-                            self.status_label.config(text=f"检测视频实时保存中: {out_path}")
-                            self._refresh_recording_status()
-                        else:
-                            writer.release()
-                            self.monitor.realtime_video_writer = None
-                            self.monitor.realtime_video_path = None
-                            self._refresh_recording_status()
-                    if self.monitor.realtime_video_writer is not None:
-                        self.monitor.realtime_video_writer.write(processed_frame)
-            except Exception as e:
-                print(f"实时保存检测视频失败: {e}")
-
-            attendance_rate = (self.monitor.current_count / self.monitor.total_students * 100
-                               if self.monitor.total_students > 0 else 0)
-            self.attendance_label.config(
-                text=f"出勤率: {self.monitor.current_count}/{self.monitor.total_students} ({attendance_rate:.1f}%)"
-            )
-
-            class_metrics = self.monitor.calculate_classroom_metrics()
-            self.analysis_label.config(
-                text=f"专注度 {class_metrics['focus_rate']:.1f}% | 抬头率 {class_metrics['head_up_rate']:.1f}% | FPS {self.monitor.actual_fps:.0f}/{self.monitor.target_fps}"
-            )
-            self.habit_label.config(text=f"主导习惯: {class_metrics['dominant_habit']}")
-            
-            if self.monitor.detected_objects:
-                object_names = [obj["class_name"] for obj in self.monitor.detected_objects]
-                self.object_label.config(
-                    text=f"检测到桌面物品: {', '.join(set(object_names))}",
-                    fg="#FF9800"
-                )
-            else:
-                self.object_label.config(text="桌面物品: 未检测", fg="#FF9800")
-            
-            # 更新人脸识别状态
-            if self.monitor.face_recognition_enabled:
-                recognized_count = sum(1 for state in self.monitor.student_states.values() 
-                                     if state.get("identity", "未知") != "未知")
-                self.face_label.config(
-                    text=f"已识别学生: {recognized_count}人",
-                    fg="#4CAF50"
-                )
-            else:
-                self._refresh_face_status()
-
-            self._render_frame_on_canvas(processed_frame)
-            if self.video_source_mode == "file":
-                self._update_video_progress()
-
-            process_time = time.perf_counter() - frame_start
-            self.monitor._frame_processing_times.append(process_time)
-            if len(self.monitor._frame_processing_times) > 5:
-                self.monitor._frame_processing_times.pop(0)
-
-            self.monitor._fps_counter += 1
-            if time.time() - self.monitor._fps_last_time >= 1.0:
-                self.monitor.actual_fps = self.monitor._fps_counter
-                self.monitor._fps_counter = 0
-                self.monitor._fps_last_time = time.time()
-
-            target_delay = max(1, int((1 / self.monitor.target_fps - process_time) * 1000))
-            self.root.after(target_delay, self.update_video)
-        else:
+        """轮询后台 worker 结果并刷新 Tk 界面。"""
+        self._drain_event_queue()
+        self._drain_frame_queue()
+        if not getattr(self, "_closing", False):
             self.root.after(30, self.update_video)
 
     def on_closing(self):
@@ -3373,15 +3800,19 @@ class ClassroomMonitorGUI:
 
         if self.running:
             self.running = False
-            time.sleep(0.5)
+        worker_stopped = self._stop_video_worker()
 
-        try:
-            self.status_label.config(text="正在生成最终报告...")
-            self.monitor.close_finalize_reports()
-        except Exception as e:
-            print(f"生成最终报告时出错: {str(e)}")
+        if worker_stopped:
+            try:
+                self.status_label.config(text="正在生成最终报告...")
+                self._generate_report_from_snapshot_sync(final=True)
+            except Exception as e:
+                print(f"生成最终报告时出错: {str(e)}")
 
-        self.monitor.release()
+            with self.monitor_lock:
+                self.monitor.release()
+        else:
+            print("后台视频处理未能及时停止，跳过同步释放资源以避免卡死。")
         self.root.destroy()
 
 
