@@ -1,8 +1,10 @@
-matplotlib
-numpy
-opencv-python
-Pillow
-torch
-torchvision
-ultralytics
-facenet-pytorch
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+matplotlib==3.10.8
+numpy==2.4.3
+opencv-python==4.13.0.92
+Pillow==12.1.1
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+ultralytics==8.4.23
+facenet-pytorch==2.5.3

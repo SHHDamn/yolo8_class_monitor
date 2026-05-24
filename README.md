@@ -12,7 +12,11 @@
 
 - `app.py`：主程序入口
 - `classroom_constants.py`：行为标签映射
+- `classroom_face_store.py`：人脸库读写与管理
+- `classroom_metrics.py`：课堂与学生指标计算
+- `classroom_recording.py`：实时录制状态与视频写入
 - `classroom_rendering.py`：中文绘字
+- `classroom_report_analysis.py`：报告文本分析结论生成
 - `classroom_reporting.py`：报告生成
 - `models/best.pt`：行为检测模型
 - `models/yolov8n-pose.pt`：姿态模型
@@ -47,14 +51,14 @@ python app.py
 - 默认打开摄像头，启动阶段只加载姿态模型。
 - 勾选“桌面物品检测”后，首次使用时才加载 `models/yolov8n.pt`。
 - 勾选“人脸识别”后，首次使用时才加载 `MTCNN + InceptionResnetV1`。
-- 行为模型只在摄像头模式下需要时加载；本地视频模式不会启用它。
+- 摄像头模式下，如果 `models/best.pt` 存在，行为模型默认启用，并在首次处理帧时按需加载。
 - 本地视频模式只做抬头/低头分析，不启用桌面物品检测、人脸识别和行为模型。
 - “开始录制”保存的是带检测叠加的画面，不是原始视频。
 
 ## 输出文件
 
-- 报告文本：`attention_logs/classroom_report.txt`
-- 图表目录：`attention_logs/`
+- 报告文本：`attention_logs/report_YYYYMMDD_HHMMSS/classroom_report.txt`
+- 图表目录：`attention_logs/report_YYYYMMDD_HHMMSS/`
 - 录制视频：`realtime_videos/`
 - 设置文件：`settings/config.txt`
 
