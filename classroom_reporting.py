@@ -7,12 +7,114 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from classroom_report_analysis import generate_classroom_analysis
+
+
+def _create_report_save_dir(base_dir):
+    os.makedirs(base_dir, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    report_dir = os.path.join(base_dir, f"report_{timestamp}")
+    suffix = 2
+    while os.path.exists(report_dir):
+        report_dir = os.path.join(base_dir, f"report_{timestamp}_{suffix}")
+        suffix += 1
+    os.makedirs(report_dir)
+    return report_dir
+
+
+def _normalize_student_number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not numeric_value.is_integer():
+        return None
+    number = int(numeric_value)
+    if number <= 0:
+        return None
+    return number
+
+
+def _build_student_report_rows(logs_by_person, safe_pct):
+    groups = {}
+    for person_id, rows in logs_by_person.items():
+        for row in rows:
+            student_number = _normalize_student_number(row.get("student_number"))
+            if student_number is None:
+                group_key = ("person", person_id)
+                label = f"ID{person_id}"
+            else:
+                group_key = ("student", student_number)
+                label = f"#{student_number}"
+
+            group = groups.setdefault(
+                group_key,
+                {
+                    "label": label,
+                    "student_number": student_number,
+                    "logs": [],
+                    "person_ids": set(),
+                },
+            )
+            group["logs"].append(row)
+            group["person_ids"].add(person_id)
+
+    student_rows = []
+    merge_notes = []
+    for group in groups.values():
+        rows = sorted(group["logs"], key=lambda item: item.get("timestamp", 0))
+        total = len(rows)
+        focus_n = sum(1 for r in rows if r.get("focused"))
+        head_up_n = sum(1 for r in rows if r.get("head_up"))
+        head_down_n = sum(1 for r in rows if r.get("head_down"))
+
+        alert_n = 0
+        prev = False
+        for r in rows:
+            cur = bool(r.get("alert", False))
+            if cur and not prev:
+                alert_n += 1
+            prev = cur
+
+        student_rows.append(
+            {
+                "label": group["label"],
+                "total": total,
+                "focus_pct": safe_pct(focus_n, total),
+                "head_up_pct": safe_pct(head_up_n, total),
+                "head_down_pct": safe_pct(head_down_n, total),
+                "alert_count": alert_n,
+            }
+        )
+
+        if group["student_number"] is not None and len(group["person_ids"]) > 1:
+            merge_notes.append(
+                f"编号 #{group['student_number']} 在检测过程中对应多个短期跟踪 ID，已按编号合并统计。"
+            )
+
+    return student_rows, sorted(merge_notes)
+
 
 def generate_new_classroom_report(monitor, save_dir="attention_logs"):
-    os.makedirs(save_dir, exist_ok=True)
+    save_dir = _create_report_save_dir(save_dir)
 
     plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "SimSun", "Arial Unicode MS"]
     plt.rcParams["axes.unicode_minus"] = False
+    plt.rcParams.update({
+        "font.size": 16,
+        "axes.titlesize": 16,
+        "axes.labelsize": 16,
+        "xtick.labelsize": 16,
+        "ytick.labelsize": 16,
+        "legend.fontsize": 16,
+        "figure.titlesize": 16,
+    })
 
     logs_by_person = {}
     for person_id, logs in getattr(monitor, "attention_logs", {}).items():
@@ -27,6 +129,25 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
             f.write("====================\n\n")
             f.write(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("本次会话无有效检测数据（未开始监测或尚未检测到学生）。\n")
+            f.write("\n")
+            for line in generate_classroom_analysis(
+                duration_sec=0,
+                student_rows=[],
+                focus_series=[],
+                head_up_series=[],
+                head_down_series=[],
+                overall_focus_pct=0.0,
+                overall_head_up_pct=0.0,
+                overall_head_down_pct=0.0,
+                warning_events=[],
+                parameter_snapshot={},
+            ):
+                f.write(f"{line}\n")
+            f.write("解释与注意事项\n")
+            f.write("--------------------\n")
+            f.write("1) 本系统指标适合做“群体趋势”分析，不建议用作对单个学生的唯一评价依据。\n")
+            f.write("2) 低头并不必然代表分心：可能是书写、阅读、看资料、看手机或疲劳等多种情况；抬头也不必然代表专注。\n")
+            f.write("3) 遮挡、光照、摄像机角度会影响识别准确性。\n")
         return
 
     first_ts = min(rows[0].get("timestamp", 0) for rows in logs_by_person.values())
@@ -64,38 +185,7 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
     overall_head_up_pct = safe_pct(head_up_frames_all, total_frames_all)
     overall_head_down_pct = safe_pct(head_down_frames_all, total_frames_all)
 
-    student_rows = []
-    for pid, rows in logs_by_person.items():
-        state = getattr(monitor, "student_states", {}).get(pid, {}) if hasattr(monitor, "student_states") else {}
-        number = state.get("student_number")
-        identity = state.get("identity", "未知") if isinstance(state, dict) else "未知"
-
-        total = len(rows)
-        focus_n = sum(1 for r in rows if r.get("focused"))
-        head_up_n = sum(1 for r in rows if r.get("head_up"))
-        head_down_n = sum(1 for r in rows if r.get("head_down"))
-        alert_n = 0
-        prev = False
-        for r in rows:
-            cur = bool(r.get("alert", False))
-            if cur and not prev:
-                alert_n += 1
-            prev = cur
-
-        label = f"#{number}" if number is not None else f"ID{pid}"
-        if identity and identity != "未知":
-            label = f"{label}-{identity}"
-
-        student_rows.append(
-            {
-                "label": label,
-                "total": total,
-                "focus_pct": safe_pct(focus_n, total),
-                "head_up_pct": safe_pct(head_up_n, total),
-                "head_down_pct": safe_pct(head_down_n, total),
-                "alert_count": alert_n,
-            }
-        )
+    student_rows, merge_notes = _build_student_report_rows(logs_by_person, safe_pct)
 
     timeline = list(range(duration_sec + 1))
     focus_series = [safe_pct(b[0], b[1]) for b in bins]
@@ -141,7 +231,6 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
             sizes,
             labels=labels,
             colors=["#1976D2", "#FF9800"],
-            autopct="%1.1f%%",
             startangle=90,
             wedgeprops={"width": 0.35},
         )
@@ -218,6 +307,20 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
         f.write(f"总体抬头率: {overall_head_up_pct:.2f}%\n")
         f.write(f"总体低头率: {overall_head_down_pct:.2f}%\n\n")
 
+        for line in generate_classroom_analysis(
+            duration_sec=duration_sec,
+            student_rows=student_rows,
+            focus_series=focus_series,
+            head_up_series=head_up_series,
+            head_down_series=head_down_series,
+            overall_focus_pct=overall_focus_pct,
+            overall_head_up_pct=overall_head_up_pct,
+            overall_head_down_pct=overall_head_down_pct,
+            warning_events=warning_events,
+            parameter_snapshot=parameter_snapshot,
+        ):
+            f.write(f"{line}\n")
+
         f.write("图表输出\n")
         f.write("--------------------\n")
         f.write("1) 班级专注率趋势图.png：班级专注率趋势\n")
@@ -231,6 +334,13 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
             f.write("--------------------\n")
             for k, v in parameter_snapshot.items():
                 f.write(f"{k}: {v}\n")
+            f.write("\n")
+
+        if merge_notes:
+            f.write("编号合并说明\n")
+            f.write("--------------------\n")
+            for note in merge_notes:
+                f.write(f"{note}\n")
             f.write("\n")
 
         f.write("学生明细（按专注度从低到高）\n")
@@ -247,6 +357,6 @@ def generate_new_classroom_report(monitor, save_dir="attention_logs"):
         f.write("解释与注意事项\n")
         f.write("--------------------\n")
         f.write("1) 本系统指标适合做“群体趋势”分析，不建议用作对单个学生的唯一评价依据。\n")
-        f.write("2) 低头并不必然代表分心：可能是书写、阅读或记笔记；抬头也不必然代表专注。\n")
+        f.write("2) 低头并不必然代表分心：可能是书写、阅读、看资料、看手机或疲劳等多种情况；抬头也不必然代表专注。\n")
         f.write("3) 遮挡、光照、摄像机角度会影响识别准确性。\n")
 

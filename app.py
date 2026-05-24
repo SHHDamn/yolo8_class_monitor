@@ -1,7 +1,6 @@
 import atexit
 import copy
 import os
-import pickle
 import queue
 import threading
 import time
@@ -22,6 +21,28 @@ from tkinter import filedialog, messagebox, simpledialog
 from ultralytics import YOLO
 
 from classroom_constants import BEHAVIOR_CLASS_ZH, normalize_behavior_class_name
+from classroom_face_store import (
+    delete_face_from_database as delete_face_store_entry,
+    get_face_database_entries as get_face_store_entries,
+    load_face_database as load_face_store,
+    rename_face_in_database as rename_face_store_entry,
+    save_face_database as save_face_store,
+)
+from classroom_metrics import (
+    calculate_classroom_metrics as calculate_classroom_metrics_data,
+    calculate_student_metrics as calculate_student_metrics_data,
+    classify_learning_habit as classify_learning_habit_data,
+    ensure_student_state_fields as ensure_student_state_fields_data,
+    get_parameter_snapshot as get_parameter_snapshot_data,
+    get_student_alert_count as get_student_alert_count_data,
+    get_warning_events as get_warning_events_data,
+    update_student_statistics as update_student_statistics_data,
+)
+from classroom_recording import (
+    ensure_recording_writer,
+    set_recording_enabled as set_recording_enabled_state,
+    stop_realtime_recording as stop_realtime_recording_state,
+)
 from classroom_rendering import draw_chinese_text, draw_chinese_texts
 from classroom_reporting import generate_new_classroom_report
 
@@ -232,52 +253,22 @@ class ClassroomMonitor:
             return False, f"人脸识别模型加载失败: {e}"
 
     def stop_realtime_recording(self):
-        final_path = self.realtime_video_path
-        if self.realtime_video_writer is not None:
-            self.realtime_video_writer.release()
-            self.realtime_video_writer = None
-        self.realtime_video_path = None
-        self.realtime_video_fps = 0
-        return final_path
+        return stop_realtime_recording_state(self)
 
     def set_recording_enabled(self, enabled):
-        self.realtime_save_enabled = bool(enabled)
-        if not self.realtime_save_enabled:
-            return self.stop_realtime_recording()
-        return self.realtime_video_path
+        return set_recording_enabled_state(self, enabled)
 
     # ========== 人脸识别相关方法 ==========
     
     def load_face_database(self):
-        if os.path.exists(self.face_database_path):
-            try:
-                with open(self.face_database_path, 'rb') as f:
-                    data = pickle.load(f)
-                    self.known_face_encodings = data.get('encodings', [])
-                    self.known_face_names = data.get('names', [])
-                print(f"已加载人脸数据库：{len(self.known_face_names)} 人")
-            except Exception as e:
-                print(f"加载人脸数据库失败：{e}")
-                self.known_face_encodings = []
-                self.known_face_names = []
-        else:
-            print("人脸数据库不存在，将创建新数据库")
-            self.known_face_encodings = []
-            self.known_face_names = []
+        self.known_face_encodings, self.known_face_names = load_face_store(self.face_database_path)
     
     def save_face_database(self):
-        try:
-            data = {
-                'encodings': self.known_face_encodings,
-                'names': self.known_face_names
-            }
-            with open(self.face_database_path, 'wb') as f:
-                pickle.dump(data, f)
-            print(f"人脸数据库已保存：{len(self.known_face_names)} 人")
-            return True
-        except Exception as e:
-            print(f"保存人脸数据库失败：{e}")
-            return False
+        return save_face_store(
+            self.face_database_path,
+            self.known_face_encodings,
+            self.known_face_names,
+        )
 
     def _merge_model_behavior_names(self):
         if not self.behavior_model_enabled or self.behavior_model is None:
@@ -451,39 +442,23 @@ class ClassroomMonitor:
         plt.close()
 
     def get_face_database_entries(self):
-        return [{"index": idx, "name": name} for idx, name in enumerate(self.known_face_names)]
+        return get_face_store_entries(self.known_face_names)
 
     def delete_face_from_database(self, index):
-        if index < 0 or index >= len(self.known_face_names):
-            return False, "无效的人脸索引"
-
-        try:
-            deleted_name = self.known_face_names.pop(index)
-            self.known_face_encodings.pop(index)
-            if not self.save_face_database():
-                return False, "删除后保存人脸数据库失败"
-            print(f"已删除人脸：{deleted_name}")
-            return True, deleted_name
-        except Exception as e:
-            return False, f"删除失败：{e}"
+        return delete_face_store_entry(
+            self.known_face_encodings,
+            self.known_face_names,
+            index,
+            self.save_face_database,
+        )
 
     def rename_face_in_database(self, index, new_name):
-        normalized_name = new_name.strip()
-        if not normalized_name:
-            return False, "姓名不能为空"
-        if index < 0 or index >= len(self.known_face_names):
-            return False, "无效的人脸索引"
-
-        try:
-            old_name = self.known_face_names[index]
-            self.known_face_names[index] = normalized_name
-            if not self.save_face_database():
-                self.known_face_names[index] = old_name
-                return False, "重命名后保存人脸数据库失败"
-            print(f"已重命名人脸：{old_name} -> {normalized_name}")
-            return True, old_name
-        except Exception as e:
-            return False, f"重命名失败：{e}"
+        return rename_face_store_entry(
+            self.known_face_names,
+            index,
+            new_name,
+            self.save_face_database,
+        )
     
     def add_face_to_database(self, face_image, name):
 
@@ -891,148 +866,36 @@ class ClassroomMonitor:
         return distracted_frames >= window_size / 2
 
     def ensure_student_state_fields(self, state):
-        state.setdefault("total_frames", 0)
-        state.setdefault("focused_frames", 0)
-        state.setdefault("head_up_frames", 0)
-        state.setdefault("head_down_frames", 0)
-        state.setdefault("head_turn_frames", 0)
-        state.setdefault("distracted_frames", 0)
-        state.setdefault("habit_label", "insufficient_data")
-        state.setdefault("identity", "未知")
+        ensure_student_state_fields_data(state)
 
     def classify_learning_habit(self, metrics):
-        if metrics["total_frames"] < 10:
-            return "数据不足"
-        if metrics["focus_rate"] >= 80 and metrics["head_up_rate"] >= 70 and metrics["head_turn_rate"] < 20:
-            return "稳定听讲型"
-        if metrics["head_down_rate"] >= 40 and metrics["focus_rate"] >= 55:
-            return "前倾低头型"
-        if metrics["head_turn_rate"] >= 35 and metrics["focus_rate"] >= 55:
-            return "侧向关注型"
-        if metrics["focus_rate"] < 55:
-            return "易分心型"
-        return "混合型"
+        return classify_learning_habit_data(metrics)
 
     def calculate_student_metrics(self, person_id):
-        state = self.student_states[person_id]
-        self.ensure_student_state_fields(state)
-        total_frames = state["total_frames"]
-        
-        if total_frames <= 0:
-            return {
-                "total_frames": 0,
-                "focus_rate": 0.0,
-                "head_up_rate": 0.0,
-                "head_down_rate": 0.0,
-                "head_turn_rate": 0.0,
-                "distracted_rate": 0.0,
-                "habit_label": "数据不足"
-            }
-
-        metrics = {
-            "total_frames": total_frames,
-            "focus_rate": state["focused_frames"] / total_frames * 100,
-            "head_up_rate": state["head_up_frames"] / total_frames * 100,
-            "head_down_rate": state["head_down_frames"] / total_frames * 100,
-            "head_turn_rate": state["head_turn_frames"] / total_frames * 100,
-            "distracted_rate": state["distracted_frames"] / total_frames * 100,
-        }
-        metrics["habit_label"] = self.classify_learning_habit(metrics)
-        return metrics
+        return calculate_student_metrics_data(self.student_states, person_id)
 
     def update_student_statistics(self, person_id, student_number, is_head_down, is_head_turned, is_focused):
-        state = self.student_states[person_id]
-        self.ensure_student_state_fields(state)
-        state["student_number"] = student_number
-        state["total_frames"] += 1
-        state["focused_frames"] += int(is_focused)
-        state["head_up_frames"] += int(not is_head_down)
-        state["head_down_frames"] += int(is_head_down)
-        state["head_turn_frames"] += int(is_head_turned)
-        state["distracted_frames"] += int(not is_focused)
-
-        metrics = self.calculate_student_metrics(person_id)
-        state["habit_label"] = metrics["habit_label"]
-        return metrics
+        return update_student_statistics_data(
+            self.student_states,
+            person_id,
+            student_number,
+            is_head_down,
+            is_head_turned,
+            is_focused,
+        )
 
     def calculate_classroom_metrics(self):
-        student_metrics = []
-        habit_counts = defaultdict(int)
-
-        for person_id, state in self.student_states.items():
-            self.ensure_student_state_fields(state)
-            if state["student_number"] is None or state["total_frames"] <= 0:
-                continue
-            metrics = self.calculate_student_metrics(person_id)
-            student_metrics.append(metrics)
-            habit_counts[metrics["habit_label"]] += 1
-
-        if not student_metrics:
-            self.latest_class_metrics = {
-                "students_analyzed": 0,
-                "focus_rate": 0.0,
-                "head_up_rate": 0.0,
-                "dominant_habit": "insufficient_data"
-            }
-            return self.latest_class_metrics
-
-        focus_rate = sum(item["focus_rate"] for item in student_metrics) / len(student_metrics)
-        head_up_rate = sum(item["head_up_rate"] for item in student_metrics) / len(student_metrics)
-        dominant_habit = max(habit_counts.items(), key=lambda item: item[1])[0] if habit_counts else "mixed"
-
-        self.latest_class_metrics = {
-            "students_analyzed": len(student_metrics),
-            "focus_rate": focus_rate,
-            "head_up_rate": head_up_rate,
-            "dominant_habit": dominant_habit
-        }
+        self.latest_class_metrics = calculate_classroom_metrics_data(self.student_states)
         return self.latest_class_metrics
 
     def get_parameter_snapshot(self):
-        return {
-            "head_down_threshold": self.head_down_threshold,
-            "time_threshold": self.time_threshold,
-            "head_turn_threshold": self.head_turn_threshold,
-            "confidence_threshold": self.confidence_threshold,
-            "filter_size": self.filter_size,
-            "total_students": self.total_students,
-            "debug": self.debug,
-            "beep_enabled": self.beep_enabled,
-            "object_detection_enabled": self.object_detection_enabled,
-            "face_recognition_enabled": self.face_recognition_enabled,
-        }
+        return get_parameter_snapshot_data(self)
 
     def get_student_alert_count(self, person_id):
-        logs = self.attention_logs.get(person_id, [])
-        if not logs:
-            return 0
-
-        alert_count = 0
-        previous_alert = False
-        for log in logs:
-            current_alert = bool(log.get("alert", False))
-            if current_alert and not previous_alert:
-                alert_count += 1
-            previous_alert = current_alert
-        return alert_count
+        return get_student_alert_count_data(self.attention_logs, person_id)
 
     def get_warning_events(self):
-        warning_events = []
-        for person_id, logs in self.attention_logs.items():
-            previous_alert = False
-            for log in logs:
-                current_alert = bool(log.get("alert", False))
-                if current_alert and not previous_alert:
-                    warning_events.append({
-                        "timestamp": log.get("timestamp", 0),
-                        "person_id": person_id,
-                        "student_number": log.get("student_number"),
-                        "identity": log.get("identity", "未知"),
-                    })
-                previous_alert = current_alert
-
-        warning_events.sort(key=lambda item: item["timestamp"])
-        return warning_events
+        return get_warning_events_data(self.attention_logs)
 
     def detect_desk_objects(self, frame):
         if not self.object_detection_enabled:
@@ -2015,6 +1878,7 @@ class ClassroomMonitorGUI:
         self.monitor_lock = threading.RLock()
         self.frame_queue = queue.Queue(maxsize=1)
         self.event_queue = queue.Queue()
+        self.report_in_progress = False
         self.worker_stop_event = threading.Event()
         self.video_worker_thread = None
         self.generation_id = 0
@@ -2335,54 +2199,7 @@ class ClassroomMonitorGUI:
         return final_path
 
     def _ensure_recording_writer_locked(self, processed_frame, source_mode, generation):
-        events = []
-        if not getattr(self.monitor, "realtime_save_enabled", False):
-            if self.monitor.realtime_video_writer is not None:
-                final_path = self.monitor.stop_realtime_recording()
-                events.append({
-                    "type": "recording_stopped",
-                    "generation": generation,
-                    "path": final_path,
-                    "message": f"录制已停止，文件已保存: {final_path}" if final_path else "录制已关闭。",
-                })
-            return events
-
-        if self.monitor.realtime_video_writer is None:
-            os.makedirs("realtime_videos", exist_ok=True)
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            src_tag = "file" if source_mode == "file" else "camera"
-            out_path = os.path.join("realtime_videos", f"detect_{src_tag}_{timestamp}.mp4")
-
-            h, w = processed_frame.shape[:2]
-            fps = int(round(self.monitor.target_fps or 30))
-            fps = max(1, min(60, fps))
-            self.monitor.realtime_video_fps = fps
-            writer = cv2.VideoWriter(out_path, self.monitor.realtime_video_fourcc, fps, (w, h))
-            if writer.isOpened():
-                self.monitor.realtime_video_writer = writer
-                self.monitor.realtime_video_path = out_path
-                events.append({
-                    "type": "recording_started",
-                    "generation": generation,
-                    "path": out_path,
-                    "message": f"检测视频实时保存中: {out_path}",
-                })
-            else:
-                writer.release()
-                self.monitor.realtime_video_writer = None
-                self.monitor.realtime_video_path = None
-                self.monitor.realtime_save_enabled = False
-                events.append({
-                    "type": "recording_stopped",
-                    "generation": generation,
-                    "path": None,
-                    "message": "实时保存检测视频失败：无法创建视频写入器。",
-                })
-                return events
-
-        if self.monitor.realtime_video_writer is not None:
-            self.monitor.realtime_video_writer.write(processed_frame)
-        return events
+        return ensure_recording_writer(self.monitor, processed_frame, source_mode, generation)
 
     def _safe_cap_get_locked(self, prop_id):
         try:
@@ -2677,6 +2494,7 @@ class ClassroomMonitorGUI:
             self._refresh_run_controls()
             self.status_label.config(text=event.get("message", "后台视频处理失败。"))
         elif event_type == "report_done":
+            self.report_in_progress = False
             if event.get("success"):
                 self._report_done()
             else:
@@ -3491,6 +3309,10 @@ class ClassroomMonitorGUI:
 
     def generate_report(self):
         """生成报告"""
+        if self.report_in_progress:
+            self.status_label.config(text="报告正在生成中，请稍候。")
+            return
+        self.report_in_progress = True
         report_thread = threading.Thread(target=self._generate_report_thread)
         report_thread.daemon = True
         report_thread.start()
@@ -3803,11 +3625,20 @@ class ClassroomMonitorGUI:
         worker_stopped = self._stop_video_worker()
 
         if worker_stopped:
+            final_report_started = False
             try:
-                self.status_label.config(text="正在生成最终报告...")
-                self._generate_report_from_snapshot_sync(final=True)
+                if self.report_in_progress:
+                    self.status_label.config(text="报告正在生成中，跳过重复最终报告。")
+                else:
+                    self.report_in_progress = True
+                    final_report_started = True
+                    self.status_label.config(text="正在生成最终报告...")
+                    self._generate_report_from_snapshot_sync(final=True)
             except Exception as e:
                 print(f"生成最终报告时出错: {str(e)}")
+            finally:
+                if final_report_started:
+                    self.report_in_progress = False
 
             with self.monitor_lock:
                 self.monitor.release()
